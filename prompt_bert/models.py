@@ -149,15 +149,37 @@ def cl_forward(cls,
         head_mask=head_mask,
         inputs_embeds=inputs_embeds,
         output_attentions=output_attentions,
-        output_hidden_states=False,
+        output_hidden_states=True, # Get hidden states
         return_dict=True,
     )
+
+    def calculate_weighted_average_top_k(encoder, hidden_mask, top_k=10):
+        # 获取最顶层隐藏状态
+        logits = encoder.cls(hidden_mask)  # 假设编码器输出可以直接用来获取预测概率
+        probs = logits.softmax(dim=-1)
+
+        # 获取前k个最可能的词汇及其概率
+        top_k_probs, top_k_indices = probs.topk(k=top_k, dim=-1)
+
+        # 用词嵌入乘以它们的概率来获取加权平均
+        word_embeddings = encoder.embeddings.word_embeddings(top_k_indices)
+        h_weighted = (word_embeddings * top_k_probs.unsqueeze(-1)).sum(dim=1)
+
+        # 归一化
+        h_weighted /= top_k_probs.sum(dim=1, keepdim=True)
+        return h_weighted
+
+    last_hidden = outputs.last_hidden_state
+    mask_idx = (input_ids == cls.mask_token_id).nonzero(as_tuple=True)
+    hidden_mask = last_hidden[mask_idx[0]]
+
+    new_pooler_output = calculate_weighted_average_top_k(encoder, hidden_mask, top_k=10)
 
 
     # Pooling
     if cls.model_args.mask_embedding_sentence:
         last_hidden = outputs.last_hidden_state
-        pooler_output = last_hidden[input_ids == cls.mask_token_id]
+        pooler_output = calculate_weighted_average_top_k(encoder, hidden_mask, top_k=10)
 
         if cls.model_args.mask_embedding_sentence_delta:
             if cls.model_args.mask_embedding_sentence_org_mlp:
@@ -358,9 +380,35 @@ def sentemb_forward(
         return_dict=True,
     )
 
+    def get_top_k_predictions(encoder, hidden_mask, k=10):
+        # 使用分类头获取概率分布
+        logits = encoder.cls(hidden_mask)  # 假设这是获得概率分布的方法
+        probs = logits.softmax(dim=-1)
+
+        # 获得前k个最高概率的词汇及其索引
+        top_k_probs, top_k_indices = probs.topk(k=k, dim=-1)
+        return top_k_indices, top_k_probs
+
+    # 计算加权平均的嵌入
+    def compute_weighted_average_embedding(encoder, hidden_mask, top_k_indices, top_k_probs):
+        # 对隐藏状态进行加权，得到平均嵌入
+        word_embeddings = encoder.embeddings.word_embeddings(top_k_indices)
+        weighted_embeddings = (word_embeddings * top_k_probs.unsqueeze(-1)).sum(dim=1)
+        normalized_weighted_embeddings = weighted_embeddings / top_k_probs.sum(dim=1, keepdim=True)
+        return normalized_weighted_embeddings
+
     if cls.model_args.mask_embedding_sentence and hasattr(cls, 'bs'):
         last_hidden = outputs.last_hidden_state
-        pooler_output = last_hidden[input_ids == cls.mask_token_id]
+
+        mask_indices = input_ids == cls.mask_token_id
+
+        # 假设encoder.cls为获取[CLS] logits的函数，根据实际情况可能需要修改
+        top_k_indices, top_k_probs = get_top_k_predictions(encoder, last_hidden[mask_indices], k=10)
+
+        # 计算加权平均的嵌入
+        pooler_output = compute_weighted_average_embedding(encoder, last_hidden[mask_indices], top_k_indices, top_k_probs)
+
+        # pooler_output = last_hidden[input_ids == cls.mask_token_id]
         if cls.model_args.mask_embedding_sentence_delta and not cls.model_args.mask_embedding_sentence_delta_no_delta_eval :
             blen = attention_mask.sum(-1) - template_len
             if cls.model_args.mask_embedding_sentence_org_mlp and not cls.model_args.mlp_only_train:
